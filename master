@@ -1,0 +1,480 @@
+#define BLYNK_TEMPLATE_ID   "Template_ID"
+#define BLYNK_TEMPLATE_NAME "Smart IOT laser detection system"
+#define BLYNK_AUTH_TOKEN    "Your_BLynk_Token"
+#define BLYNK_PRINT         Serial
+
+#include <ESP8266WiFi.h>
+#include <BlynkSimpleEsp8266.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+#include <ESP8266HTTPClient.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
+// ══════════════════════════════════════════════════════════
+//   PIN DEFINITIONS
+// ══════════════════════════════════════════════════════════
+#define LDR_PIN     D6
+#define PIR_PIN     D7
+#define BUZZER_PIN  D5
+
+// ══════════════════════════════════════════════════════════
+//   TIMING
+// ══════════════════════════════════════════════════════════
+#define BUZZER_TIME     8000
+#define DEBOUNCE_MS     50
+#define LDR_CONFIRM_MS  80
+#define RECONNECT_DELAY 5000
+#define PHOTO_DELAY     1000
+
+// ══════════════════════════════════════════════════════════
+//   CREDENTIALS
+// ══════════════════════════════════════════════════════════
+const char WIFI_SSID[] = "Kirtwifi";    // Here you have to write your wifi name and your password 
+const char WIFI_PASS[] = "0000";
+
+#define BOT_TOKEN "Telegram_Bot_token"  // create your chatbot through telegram and get token and chat_id
+#define CHAT_ID   "chat_id"
+
+const String SNAPSHOT_URL = "http://10.159.6.17:8080/shot.jpg";
+
+// ══════════════════════════════════════════════════════════
+//   MILITARY ALERT BUZZER — Hardware Timer Driven
+//
+//  Pattern (repeating, total ~1400ms per cycle):
+//
+//  ┌─────────────────────────────────────────────────────┐
+//  │  BURST of 3 sharp pulses  →  long silence  → repeat │
+//  │                                                     │
+//  │  PULSE: ON 80ms  OFF 60ms  ×3  = 420ms             │
+//  │  GAP:   silence  400ms                              │
+//  │  Then: single long BOOM: ON 180ms  OFF 60ms         │
+//  │  GAP:   silence  280ms                              │
+//  │                                                     │
+//  │  Sounds like:                                       │
+//  │  BEEP-BEEP-BEEP ··· BOOOOM ··· BEEP-BEEP-BEEP ...  │
+//  │  Urgent, rhythmic, impossible to ignore             │
+//  └─────────────────────────────────────────────────────┘
+//
+//  Timer fires every 20ms. Each tick = 1 step in sequence.
+//  Sequence array holds ON/OFF durations in 20ms units.
+// ══════════════════════════════════════════════════════════
+#include <osapi.h>
+#include <os_type.h>
+
+// Sequence: {pin_state, duration_in_ticks}
+// Each tick = 20ms
+// ON=1, OFF=0
+struct BuzzerStep {
+  uint8_t       pinState;   // HIGH or LOW
+  uint8_t       ticks;      // how many 20ms ticks to hold
+};
+
+// Military alert sequence (one full cycle ~1400ms)
+//   3× sharp pulses:  80ms ON, 60ms OFF each
+//   400ms silence
+//   1× boom pulse:    180ms ON, 60ms OFF
+//   280ms silence
+static const BuzzerStep milAlert[] = {
+  {HIGH, 4},   // BEEP  ON  80ms
+  {LOW,  3},   // BEEP  OFF 60ms
+  {HIGH, 4},   // BEEP  ON  80ms
+  {LOW,  3},   // BEEP  OFF 60ms
+  {HIGH, 4},   // BEEP  ON  80ms
+  {LOW,  20},  // silence  400ms
+  {HIGH, 9},   // BOOM  ON  180ms
+  {LOW,  3},   // BOOM  OFF 60ms
+  {LOW,  14},  // silence  280ms
+};
+static const int milAlertLen = sizeof(milAlert) / sizeof(BuzzerStep);
+
+static os_timer_t buzzerTimer;
+volatile bool     buzzerRunning = false;
+
+static int  seqIdx    = 0;   // current step index
+static int  ticksLeft = 0;   // ticks remaining in current step
+
+void ICACHE_RAM_ATTR buzzerISR(void* arg) {
+  if (!buzzerRunning) {
+    digitalWrite(BUZZER_PIN, LOW);
+    return;
+  }
+
+  if (ticksLeft > 0) {
+    ticksLeft--;
+    return;
+  }
+
+  // Move to next step
+  seqIdx = (seqIdx + 1) % milAlertLen;
+  digitalWrite(BUZZER_PIN, milAlert[seqIdx].pinState ? HIGH : LOW);
+  ticksLeft = milAlert[seqIdx].ticks - 1;
+}
+
+void startBuzzer() {
+  seqIdx       = 0;
+  ticksLeft    = milAlert[0].ticks - 1;
+  buzzerRunning = true;
+  digitalWrite(BUZZER_PIN, milAlert[0].pinState ? HIGH : LOW);
+  os_timer_setfn(&buzzerTimer, buzzerISR, nullptr);
+  os_timer_arm(&buzzerTimer, 20, true);   // fires every 20ms
+}
+
+void stopBuzzerTimer() {
+  buzzerRunning = false;
+  os_timer_disarm(&buzzerTimer);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ══════════════════════════════════════════════════════════
+//   GLOBAL IMAGE BUFFER
+// ══════════════════════════════════════════════════════════
+uint8_t* imgBuffer  = nullptr;
+int      imgSize    = 0;
+int      imgReadPos = 0;
+
+bool  isMoreDataAvailable() { return imgReadPos < imgSize; }
+byte  getNextByte()         { return imgBuffer[imgReadPos++]; }
+byte* getNextBuffer()       {
+  if (imgReadPos >= imgSize) return nullptr;
+  byte* ptr  = imgBuffer + imgReadPos;
+  imgReadPos = imgSize;
+  return ptr;
+}
+
+// ══════════════════════════════════════════════════════════
+//   OBJECTS & STATE
+// ══════════════════════════════════════════════════════════
+BlynkTimer           timer;
+WiFiClientSecure     secureClient;
+UniversalTelegramBot bot(BOT_TOKEN, secureClient);
+
+bool          alarmActive   = false;
+bool          photoSent     = false;
+unsigned long buzzerStart   = 0;
+unsigned long lastReconnect = 0;
+
+// ── High-accuracy LDR state ────────────────────────────────
+int           lastLdrRaw      = LOW;
+unsigned long ldrChangeTime   = 0;
+bool          ldrStable       = false;
+bool          ldrConfirmed    = false;
+unsigned long ldrConfirmStart = 0;
+bool          ldrConfirming   = false;
+
+// ══════════════════════════════════════════════════════════
+//   PROTOTYPES
+// ══════════════════════════════════════════════════════════
+bool readLDR();
+void triggerAlarm();
+void stopAlarm();
+void maintainBlynk();
+void sendSensorData();
+void captureAndSendPhoto();
+
+// ══════════════════════════════════════════════════════════
+//   SETUP
+// ══════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n╔══════════════════════════════════════════╗");
+  Serial.println("║   SMART LASER SECURITY  v7.0             ║");
+  Serial.println("║   Military Alert Buzzer Edition          ║");
+  Serial.println("╚══════════════════════════════════════════╝\n");
+
+  pinMode(LDR_PIN,    INPUT);
+  pinMode(PIR_PIN,    INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // ── Startup confirm beeps ─────────────────────────────
+  Serial.println("🔔 Startup beeps...");
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER_PIN, HIGH); delay(100);
+    digitalWrite(BUZZER_PIN, LOW);  delay(100);
+  }
+
+  // ── Full siren test: 2 full cycles so you can hear it ─
+  Serial.println("🚨 Military alert test (3 sec)...");
+  startBuzzer();
+  delay(3000);
+  stopBuzzerTimer();
+  delay(200);
+  Serial.println("   Done! You should hear: BEEP-BEEP-BEEP ··· BOOOOM");
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("📶 Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500); Serial.print("."); attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected!");
+    Serial.print("   IP  : "); Serial.println(WiFi.localIP());
+    Serial.print("   RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+
+    secureClient.setInsecure();
+
+    Blynk.config(BLYNK_AUTH_TOKEN, "blynk.cloud", 80);
+    Blynk.connect(8000);
+    Serial.println(Blynk.connected() ? "✅ Blynk Connected!" : "⚠️  Blynk will retry...");
+
+    bot.sendMessage(CHAT_ID,
+      "✅ *Laser Security System ONLINE! v7.0*\n"
+      "━━━━━━━━━━━━━━━━━━━━\n"
+      "📷 Camera  : IP Webcam Active\n"
+      "🌐 Cam URL : 10.159.6.17:8080\n"
+      "🔊 Buzzer  : Military Alert 🎖️\n"
+      "🔍 Status  : Monitoring Started\n"
+      "🔔 Alerts  : Telegram + Blynk\n"
+      "━━━━━━━━━━━━━━━━━━━━\n"
+      "_Any intrusion will be captured & reported._",
+      "Markdown");
+    Serial.println("📲 Startup message sent!");
+
+    digitalWrite(BUZZER_PIN, HIGH); delay(300);
+    digitalWrite(BUZZER_PIN, LOW);
+
+  } else {
+    Serial.println("\n❌ WiFi Failed!");
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(BUZZER_PIN, HIGH); delay(50);
+      digitalWrite(BUZZER_PIN, LOW);  delay(50);
+    }
+  }
+
+  timer.setInterval(200L, sendSensorData);
+  Serial.println("\n✅ SYSTEM ACTIVE — Laser armed!\n");
+}
+
+// ══════════════════════════════════════════════════════════
+//   MAIN LOOP
+// ══════════════════════════════════════════════════════════
+void loop() {
+  maintainBlynk();
+  if (Blynk.connected()) Blynk.run();
+  timer.run();
+
+  bool laserBroken = readLDR();
+
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 500) {
+    lastPrint = millis();
+    Serial.printf("[SENSOR] LDR_raw=%d | Stable=%d | Confirmed=%d | PIR=%d | Alarm=%d | Blynk=%s\n",
+      digitalRead(LDR_PIN), ldrStable, ldrConfirmed,
+      digitalRead(PIR_PIN), alarmActive,
+      Blynk.connected() ? "OK" : "OFFLINE");
+  }
+
+  if (laserBroken && !alarmActive)                          triggerAlarm();
+  if (alarmActive && millis() - buzzerStart >= BUZZER_TIME) stopAlarm();
+}
+
+// ══════════════════════════════════════════════════════════
+//   HIGH-ACCURACY LDR READ — Two-layer filter
+// ══════════════════════════════════════════════════════════
+bool readLDR() {
+  int raw = digitalRead(LDR_PIN);
+  unsigned long now = millis();
+
+  if (raw != lastLdrRaw) {
+    lastLdrRaw    = raw;
+    ldrChangeTime = now;
+    ldrConfirming = false;
+  }
+
+  if ((now - ldrChangeTime) >= DEBOUNCE_MS) {
+    bool newStable = (lastLdrRaw == HIGH);
+    if (newStable != ldrStable) {
+      ldrStable = newStable;
+      if (ldrStable) {
+        ldrConfirming   = true;
+        ldrConfirmStart = now;
+        ldrConfirmed    = false;
+      } else {
+        ldrConfirmed  = false;
+        ldrConfirming = false;
+      }
+    }
+  }
+
+  if (ldrConfirming && ldrStable) {
+    if ((now - ldrConfirmStart) >= LDR_CONFIRM_MS) {
+      ldrConfirmed  = true;
+      ldrConfirming = false;
+    }
+  }
+
+  return ldrConfirmed;
+}
+
+// ══════════════════════════════════════════════════════════
+//   TRIGGER ALARM
+// ══════════════════════════════════════════════════════════
+void triggerAlarm() {
+  Serial.println("\n🚨🚨🚨 INTRUSION DETECTED 🚨🚨🚨\n");
+
+  alarmActive = true;
+  photoSent   = false;
+  buzzerStart = millis();
+
+  startBuzzer();   // ← fires immediately via hardware timer
+  Serial.println("🔊 Military alert STARTED");
+
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V0, 1);
+    Blynk.logEvent("intrusion_detected", "⚠️ Intrusion Detected! Check NOW!");
+  }
+
+  bot.sendMessage(CHAT_ID,
+    "🚨 *INTRUSION ALERT!* 🚨\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "⚡ Laser beam BROKEN!\n"
+    "🔊 Military Alert SOUNDING!\n"
+    "📷 Capturing photo now...\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "_Take immediate action!_",
+    "Markdown");
+
+  delay(PHOTO_DELAY);      // buzzer keeps going during this
+  captureAndSendPhoto();   // buzzer keeps going during this too
+}
+
+// ══════════════════════════════════════════════════════════
+//   CAPTURE & SEND PHOTO → TELEGRAM via IP Webcam
+// ══════════════════════════════════════════════════════════
+void captureAndSendPhoto() {
+  if (photoSent) return;
+
+  Serial.println("📷 Fetching photo from IP Webcam...");
+
+  WiFiClient httpClient;
+  HTTPClient http;
+
+  http.begin(httpClient, SNAPSHOT_URL);
+  http.setTimeout(10000);
+  http.addHeader("User-Agent", "ESP8266-Security/7.0");
+  int httpCode = http.GET();
+
+  Serial.printf("   HTTP Code: %d\n", httpCode);
+
+  if (httpCode == HTTP_CODE_OK) {
+    imgSize = http.getSize();
+    Serial.printf("   Size: %d bytes\n", imgSize);
+
+    int bufSize = (imgSize == -1) ? 80000 : imgSize;
+    imgBuffer   = (uint8_t*)malloc(bufSize);
+
+    if (imgBuffer != nullptr) {
+      WiFiClient*   stream   = http.getStreamPtr();
+      int           received = 0;
+      unsigned long t0       = millis();
+
+      while (received < bufSize && millis() - t0 < 8000) {
+        if (stream->available()) {
+          int chunk = stream->readBytes(imgBuffer + received,
+                        min((int)stream->available(), bufSize - received));
+          received += chunk;
+        }
+        if (received >= 2 &&
+            imgBuffer[received - 2] == 0xFF &&
+            imgBuffer[received - 1] == 0xD9) {
+          Serial.println("   JPEG EOF ✅");
+          break;
+        }
+        yield();
+      }
+
+      Serial.printf("   Received: %d bytes\n", received);
+
+      if (received >= 5000) {
+        imgReadPos = 0;
+        imgSize    = received;
+
+        String result = bot.sendPhotoByBinary(
+          CHAT_ID, "image/jpeg", imgSize,
+          isMoreDataAvailable, getNextByte, getNextBuffer, nullptr
+        );
+
+        if (result.length() > 0) {
+          Serial.println("✅ Photo sent!");
+          bot.sendMessage(CHAT_ID,
+            "📷 *Intruder captured above!*\n"
+            "🔒 Take action immediately!\n"
+            "🌐 Live: http://10.159.6.17:8080",
+            "Markdown");
+          photoSent = true;
+        } else {
+          Serial.println("❌ Telegram rejected photo");
+          bot.sendMessage(CHAT_ID,
+            "⚠️ Photo upload failed.\n📱 Live: http://10.159.6.17:8080", "");
+        }
+      } else {
+        bot.sendMessage(CHAT_ID,
+          "⚠️ Incomplete photo.\n📱 Live: http://10.159.6.17:8080", "");
+      }
+
+      free(imgBuffer);
+      imgBuffer = nullptr;
+
+    } else {
+      bot.sendMessage(CHAT_ID, "⚠️ Low RAM.\n📱 Live: http://10.159.6.17:8080", "");
+    }
+
+  } else {
+    bot.sendMessage(CHAT_ID,
+      "🚨 *INTRUSION!*\n⚠️ Camera error HTTP " + String(httpCode) +
+      "\n• Open IP Webcam → Start Server", "Markdown");
+  }
+
+  http.end();
+}
+
+// ══════════════════════════════════════════════════════════
+//   STOP ALARM
+// ══════════════════════════════════════════════════════════
+void stopAlarm() {
+  stopBuzzerTimer();
+  alarmActive = false;
+  Serial.println("🔕 Alarm Stopped.\n");
+
+  if (Blynk.connected()) Blynk.virtualWrite(V0, 0);
+
+  bot.sendMessage(CHAT_ID,
+    "✅ *Alarm Stopped*\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "🟢 Area clear\n"
+    "🔍 System resumed monitoring\n"
+    "━━━━━━━━━━━━━━━━━━━━",
+    "Markdown");
+}
+
+// ══════════════════════════════════════════════════════════
+//   BLYNK AUTO-RECONNECT
+// ══════════════════════════════════════════════════════════
+void maintainBlynk() {
+  if (!Blynk.connected() && WiFi.status() == WL_CONNECTED) {
+    if (millis() - lastReconnect >= RECONNECT_DELAY) {
+      lastReconnect = millis();
+      Serial.println("🔄 Retrying Blynk...");
+      Blynk.connect(3000);
+      if (Blynk.connected()) Serial.println("✅ Blynk Reconnected!");
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//   SEND SENSOR DATA TO BLYNK
+// ══════════════════════════════════════════════════════════
+void sendSensorData() {
+  if (!Blynk.connected()) return;
+  Blynk.virtualWrite(V1, digitalRead(LDR_PIN));
+  Blynk.virtualWrite(V2, digitalRead(PIR_PIN));
+}
